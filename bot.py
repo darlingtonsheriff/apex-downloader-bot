@@ -1,8 +1,9 @@
 """
 Personal Video Downloader Telegram Bot
 ---------------------------------------
-Send it a TikTok, Instagram, or YouTube link and it replies with the video.
-No forced group-joins, no ads, no gatekeeping — just the file.
+Send it a TikTok, Instagram, or YouTube link and it replies with the video
+(and for Instagram carousels, every photo/video in the post).
+No forced group-joins, no ads, no gatekeeping — just the file(s).
 
 SETUP:
 1. Get a bot token from @BotFather on Telegram (send /newbot, follow prompts).
@@ -40,7 +41,6 @@ FAILURE_ALERT_THRESHOLD = 3
 _consecutive_failures = 0
 
 # Telegram bots can send files up to 50MB via the standard Bot API.
-# If you need bigger files, you'd need to run a local Bot API server (see README).
 MAX_FILE_SIZE_MB = 50
 
 # Cap how many downloads run at once. Extra requests wait in line instead of
@@ -49,10 +49,15 @@ MAX_FILE_SIZE_MB = 50
 MAX_CONCURRENT_DOWNLOADS = 3
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# Optional: paste the full contents of a cookies.txt file into this environment
-# variable when running on a host (e.g. Railway) where you can't drop an actual
-# cookies.txt file next to the script. Used as a fallback if no local file exists.
-YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES")
+# Optional: paste the full contents of a cookies.txt file (covering any sites that
+# need login — YouTube's bot-check, Instagram stories/private posts, etc.) into
+# this environment variable when running on a host (e.g. Railway) where you can't
+# drop an actual cookies.txt file next to the script. COOKIES_TXT is the preferred
+# name; YOUTUBE_COOKIES is kept as a fallback for anyone who already set that one.
+COOKIES_ENV = os.environ.get("COOKIES_TXT") or os.environ.get("YOUTUBE_COOKIES")
+
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
+VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm"}
 
 URL_PATTERN = re.compile(
     r"(https?://(?:www\.)?(?:"
@@ -66,8 +71,8 @@ URL_PATTERN = re.compile(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a TikTok, Instagram, or YouTube link and I'll send the video back.\n"
-        "No group-joins, no ads — just the file."
+        "Send me a TikTok, Instagram, or YouTube link and I'll send the video(s) back.\n"
+        "No group-joins, no ads — just the file(s)."
     )
 
 
@@ -84,8 +89,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group(1)
     chat_id = update.effective_chat.id
+    # Instagram carousels and TikTok "photo mode" slideshows can contain multiple
+    # photos/videos in one post — both need noplaylist=False to grab every item.
+    # YouTube stays noplaylist=True so a playlist link doesn't download the whole thing.
+    is_multi_item_site = "instagram.com" in url.lower() or "tiktok.com" in url.lower()
 
-    # React with 👀 on the user's own message (like the animation in your screenshot)
+    # React with 👀 on the user's own message
     try:
         await context.bot.set_message_reaction(
             chat_id=chat_id,
@@ -106,34 +115,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+            out_template = os.path.join(tmp_dir, "%(id)s_%(autonumber)s.%(ext)s")
             ydl_opts = {
                 "outtmpl": out_template,
-                # bestvideo+bestaudio: download the best video-only and best audio-only
-                # streams separately and merge them with ffmpeg. Falls back to a single
-                # pre-merged "best" stream if separate streams aren't available.
+                # bestvideo+bestaudio guarantees an audio track always gets paired
+                # with the video. We then force a re-encode below to standard
+                # H.264/AAC regardless of the source codec, so playback (and audio)
+                # is guaranteed on every device.
                 "format": "bestvideo+bestaudio/best",
                 "quiet": True,
                 "no_warnings": True,
-                "noplaylist": True,
+                # Instagram carousels and TikTok slideshows (multi-photo/video posts)
+                # need noplaylist=False to get every item. Keep it True elsewhere so a
+                # YouTube playlist link doesn't accidentally grab the whole playlist.
+                "noplaylist": not is_multi_item_site,
                 "merge_output_format": "mp4",
-                # Puts playback metadata at the START of the file instead of the end.
-                # Without this, some players (including Telegram's in-app preview)
-                # can show a frozen first frame until the whole file finishes loading.
-                "postprocessor_args": {"default": ["-movflags", "+faststart"]},
+                # Force re-encode to H.264 video + AAC audio, and put playback
+                # metadata at the START of the file (faststart) so it doesn't
+                # freeze on the first frame while streaming/previewing.
+                "postprocessor_args": {
+                    "default": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"]
+                },
             }
 
-            # Cookies for sites that require login verification (mainly YouTube).
-            # Prefer a local cookies.txt next to the script; fall back to the
-            # YOUTUBE_COOKIES environment variable (used on hosts like Railway
-            # where you can't drop a plain file next to the code).
+            # Cookies for sites that require login verification (YouTube bot-check,
+            # Instagram stories/private content). Prefer a local cookies.txt next to
+            # the script; fall back to the YOUTUBE_COOKIES environment variable
+            # (used on hosts like Railway where you can't drop a plain file next to
+            # the code).
             cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
             if os.path.exists(cookies_path):
                 ydl_opts["cookiefile"] = cookies_path
-            elif YOUTUBE_COOKIES_ENV:
+            elif COOKIES_ENV:
                 env_cookies_path = os.path.join(tmp_dir, "cookies.txt")
                 with open(env_cookies_path, "w", encoding="utf-8") as cf:
-                    cf.write(YOUTUBE_COOKIES_ENV)
+                    cf.write(COOKIES_ENV)
                 ydl_opts["cookiefile"] = env_cookies_path
 
             try:
@@ -142,47 +158,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 def download():
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
-                        return ydl.prepare_filename(info), info
+                        entries = info.get("entries") if info.get("entries") is not None else [info]
+                        results = []
+                        for entry in entries:
+                            if not entry:
+                                continue
+                            fp = ydl.prepare_filename(entry)
+                            results.append((fp, entry))
+                        return results
 
-                filepath, info = await loop.run_in_executor(None, download)
+                results = await loop.run_in_executor(None, download)
 
-                # yt-dlp may merge to .mp4 even if prepare_filename guessed differently
-                if not os.path.exists(filepath):
-                    base, _ = os.path.splitext(filepath)
-                    candidate = base + ".mp4"
-                    if os.path.exists(candidate):
-                        filepath = candidate
-
-                size_mb = os.path.getsize(filepath) / (1024 * 1024)
-                if size_mb > MAX_FILE_SIZE_MB:
-                    await status_msg.edit_text(
-                        f"Video is {size_mb:.0f}MB, which is over Telegram's {MAX_FILE_SIZE_MB}MB "
-                        "bot upload limit. Try a shorter/lower-quality link."
-                    )
+                if not results:
+                    await status_msg.edit_text("Couldn't find anything downloadable in that link.")
                     return
 
+                sent_videos = 0
+                sent_photos = 0
+                skipped_too_big = 0
+
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-                with open(filepath, "rb") as f:
-                    await update.message.reply_video(
-                        video=f,
-                        supports_streaming=True,
-                        width=info.get("width"),
-                        height=info.get("height"),
-                        duration=info.get("duration"),
+
+                for filepath, entry in results:
+                    # yt-dlp may merge/convert to .mp4 even if prepare_filename guessed differently
+                    if not os.path.exists(filepath):
+                        base, _ext = os.path.splitext(filepath)
+                        for alt_ext in (".mp4", ".jpg", ".jpeg", ".png", ".webp"):
+                            candidate = base + alt_ext
+                            if os.path.exists(candidate):
+                                filepath = candidate
+                                break
+
+                    if not os.path.exists(filepath):
+                        continue
+
+                    ext = os.path.splitext(filepath)[1].lstrip(".").lower()
+
+                    if ext in VIDEO_EXTENSIONS:
+                        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                        if size_mb > MAX_FILE_SIZE_MB:
+                            skipped_too_big += 1
+                            continue
+                        with open(filepath, "rb") as f:
+                            await update.message.reply_video(
+                                video=f,
+                                supports_streaming=True,
+                                width=entry.get("width"),
+                                height=entry.get("height"),
+                                duration=entry.get("duration"),
+                            )
+                        sent_videos += 1
+
+                    elif ext in IMAGE_EXTENSIONS:
+                        with open(filepath, "rb") as f:
+                            await update.message.reply_photo(photo=f)
+                        sent_photos += 1
+
+                summary_parts = []
+                if sent_videos:
+                    summary_parts.append(f"{sent_videos} video(s)")
+                if sent_photos:
+                    summary_parts.append(f"{sent_photos} photo(s)")
+                if skipped_too_big:
+                    summary_parts.append(f"{skipped_too_big} skipped (over {MAX_FILE_SIZE_MB}MB)")
+
+                if sent_videos or sent_photos:
+                    await status_msg.delete()
+                    try:
+                        await context.bot.set_message_reaction(
+                            chat_id=chat_id,
+                            message_id=update.message.message_id,
+                            reaction="✅",
+                        )
+                    except Exception:
+                        logger.exception("Could not update message reaction")
+                    _consecutive_failures = 0
+                else:
+                    await status_msg.edit_text(
+                        "Couldn't send anything from that link "
+                        f"({', '.join(summary_parts) if summary_parts else 'nothing downloadable'})."
                     )
-
-                await status_msg.delete()
-
-                try:
-                    await context.bot.set_message_reaction(
-                        chat_id=chat_id,
-                        message_id=update.message.message_id,
-                        reaction="✅",
-                    )
-                except Exception:
-                    logger.exception("Could not update message reaction")
-
-                _consecutive_failures = 0
 
             except Exception as e:
                 logger.exception("Download failed for %s", url)
@@ -196,7 +251,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             text=(
                                 f"⚠️ {_consecutive_failures} downloads have failed in a row.\n"
                                 "Likely fix: redeploy to pick up the latest yt-dlp, "
-                                "or refresh cookies.txt if it's a YouTube link."
+                                "or refresh cookies.txt if it's a YouTube/Instagram-login link."
                             ),
                         )
                     except Exception:
